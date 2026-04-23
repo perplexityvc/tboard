@@ -31,12 +31,6 @@ DB_USER="postgres"
 DB_PASSWORD="$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 20)"
 
 # ─── Detect init system ───────────────────────────────────────────────────────
-#
-# systemd  → use systemctl
-# upstart  → use initctl  (Ubuntu <= 14.04, rare)
-# sysvinit → use service
-# none     → direct process control (container/chroot without an init daemon)
-#
 detect_init() {
   if command -v systemctl &>/dev/null && systemctl list-units &>/dev/null 2>&1; then
     echo "systemd"
@@ -53,11 +47,9 @@ INIT_SYSTEM="$(detect_init)"
 info "Init system detected: ${INIT_SYSTEM}"
 
 # ─── Unified service helper ───────────────────────────────────────────────────
-# Usage: svc <enable|start|stop|restart|status> <service-name>
 svc() {
   local action="$1"
   local name="$2"
-
   case "$INIT_SYSTEM" in
     systemd)
       case "$action" in
@@ -65,62 +57,55 @@ svc() {
         start)   systemctl start  "$name" ;;
         stop)    systemctl stop   "$name" ;;
         restart) systemctl restart "$name" ;;
+        reload)  systemctl reload  "$name" ;;
         status)  systemctl status  "$name" --no-pager ;;
-      esac
-      ;;
+      esac ;;
     upstart)
       case "$action" in
         enable)  true ;;
-        start)   initctl start   "$name" 2>/dev/null || service "$name" start ;;
-        stop)    initctl stop    "$name" 2>/dev/null || service "$name" stop  ;;
-        restart) initctl restart "$name" 2>/dev/null || service "$name" restart ;;
-        status)  initctl status  "$name" 2>/dev/null || service "$name" status ;;
-      esac
-      ;;
+        reload)  service "$name" reload || true ;;
+        start|stop|restart|status) initctl "$action" "$name" 2>/dev/null || service "$name" "$action" ;;
+      esac ;;
     sysvinit)
       case "$action" in
         enable)  update-rc.d "$name" defaults 2>/dev/null || true ;;
+        reload)  service "$name" reload || true ;;
         start|stop|restart|status) service "$name" "$action" ;;
-      esac
-      ;;
+      esac ;;
     none)
-      # No init daemon — start processes directly where possible.
       case "$action" in
         enable)  true ;;
+        reload)
+          if [[ "$name" == "postgresql" ]]; then
+            local pgv pgc
+            pgv=$(pg_lsclusters -h | awk '{print $1}' | head -1)
+            pgc=$(pg_lsclusters -h | awk '{print $2}' | head -1)
+            pg_ctlcluster "$pgv" "$pgc" reload || true
+          fi ;;
         start)
           if [[ "$name" == "postgresql" ]]; then
-            PG_VER=$(pg_lsclusters -h | awk '{print $1}' | head -1)
-            PG_CLUSTER=$(pg_lsclusters -h | awk '{print $2}' | head -1)
-            pg_ctlcluster "$PG_VER" "$PG_CLUSTER" start || true
+            local pgv pgc
+            pgv=$(pg_lsclusters -h | awk '{print $1}' | head -1)
+            pgc=$(pg_lsclusters -h | awk '{print $2}' | head -1)
+            pg_ctlcluster "$pgv" "$pgc" start || true
           elif [[ "$name" == "thingsboard" ]]; then
             /usr/share/thingsboard/bin/thingsboard.sh start
-          fi
-          ;;
+          fi ;;
         stop)
           if [[ "$name" == "thingsboard" ]]; then
             /usr/share/thingsboard/bin/thingsboard.sh stop || true
-          fi
-          ;;
+          fi ;;
         restart)
-          svc stop  "$name" || true
-          sleep 2
-          svc start "$name"
-          ;;
+          svc stop  "$name" || true; sleep 2; svc start "$name" ;;
         status)
           if [[ "$name" == "thingsboard" ]]; then
             /usr/share/thingsboard/bin/thingsboard.sh status || true
-          fi
-          ;;
-      esac
-      ;;
+          fi ;;
+      esac ;;
   esac
 }
 
 # ─── Lift policy-rc.d restriction ────────────────────────────────────────────
-# Some Ubuntu images (cloud-init, LXC, minimal) ship a policy-rc.d that blocks
-# service starts triggered by dpkg post-install scripts, producing:
-#   "invoke-rc.d: policy-rc.d denied execution of start"
-# We override it for the duration of this script, then restore it.
 POLICY_RC="/usr/sbin/policy-rc.d"
 POLICY_RC_BAK="/usr/sbin/policy-rc.d.bak"
 
@@ -130,7 +115,6 @@ restore_policy() {
   else
     rm -f "$POLICY_RC"
   fi
-  # Also clean up any temp download dir
   [[ -n "${TMPDIR_DL:-}" ]] && rm -rf "$TMPDIR_DL"
 }
 trap restore_policy EXIT
@@ -155,25 +139,31 @@ OS_VER=$(grep -oP '(?<=^VERSION_ID=).+' /etc/os-release | tr -d '"')
   && warn "Tested on Ubuntu 22.04. Detected: $OS_VER — continuing anyway."
 success "OS: Ubuntu $OS_VER"
 
+# In container environments /proc/meminfo reports the HOST machine RAM,
+# not the container's allocation. Cap at 64GB to avoid absurd heap sizes.
 RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 RAM_GB=$(( RAM_KB / 1024 / 1024 ))
-if [[ "$RAM_GB" -lt 3 ]]; then
-  error "Insufficient RAM: ${RAM_GB}GB. ThingsBoard requires at least 4GB."
-elif [[ "$RAM_GB" -lt 4 ]]; then
-  warn "Low RAM (${RAM_GB}GB). ThingsBoard may be unstable. Recommended: 4GB+."
-else
-  success "RAM: ${RAM_GB}GB — OK"
+MAX_REPORTED_RAM=64
+if [[ "$RAM_GB" -gt "$MAX_REPORTED_RAM" ]]; then
+  warn "Detected RAM (${RAM_GB}GB) looks like a container reporting host RAM."
+  warn "Capping reported RAM at ${MAX_REPORTED_RAM}GB for heap calculation."
+  RAM_GB=$MAX_REPORTED_RAM
 fi
+if   [[ "$RAM_GB" -lt 3 ]]; then error "Insufficient RAM: ${RAM_GB}GB. Need at least 4GB."
+elif [[ "$RAM_GB" -lt 4 ]]; then warn  "Low RAM (${RAM_GB}GB). Recommended: 4GB+."
+else success "RAM: ${RAM_GB}GB — OK"; fi
 
 DISK_AVAIL=$(df / --output=avail -BG | tail -1 | tr -d 'G')
-[[ "$DISK_AVAIL" -lt 10 ]] \
-  && warn "Low disk space: ${DISK_AVAIL}GB free. Recommend at least 20GB."
+[[ "$DISK_AVAIL" -lt 10 ]] && warn "Low disk: ${DISK_AVAIL}GB free. Recommend 20GB+."
 success "Disk: ${DISK_AVAIL}GB free — OK"
 
-# ─── Compute JVM heap (half of RAM, min 2G) ───────────────────────────────────
+# Heap = half of RAM, min 2G, max 8G (single-node install).
+# Giving more than 8G to a single ThingsBoard node on PostgreSQL
+# offers no real benefit and risks long GC pauses.
 HEAP_GB=$(( RAM_GB / 2 ))
 [[ "$HEAP_GB" -lt 2 ]] && HEAP_GB=2
-info "JVM heap will be set to ${HEAP_GB}G"
+[[ "$HEAP_GB" -gt 8 ]] && HEAP_GB=8
+info "JVM heap will be set to ${HEAP_GB}G (half of ${RAM_GB}GB RAM, capped at 8G)"
 
 # ─── System update & prerequisites ───────────────────────────────────────────
 header "Updating system packages"
@@ -212,11 +202,9 @@ else
   success "PostgreSQL 16 package installed"
 fi
 
-# Start PostgreSQL via whichever init system we have
 svc enable postgresql
 svc start  postgresql
 
-# Wait for PostgreSQL to accept connections
 RETRIES=15
 until pg_isready -q 2>/dev/null || [[ "$RETRIES" -eq 0 ]]; do
   info "Waiting for PostgreSQL to accept connections…"
@@ -224,30 +212,54 @@ until pg_isready -q 2>/dev/null || [[ "$RETRIES" -eq 0 ]]; do
   (( RETRIES-- )) || true
 done
 pg_isready -q || error "PostgreSQL failed to start. Check: pg_lsclusters"
-
 success "PostgreSQL is running"
 
 # ─── Configure PostgreSQL ─────────────────────────────────────────────────────
 header "Configuring PostgreSQL"
 
-sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD '${DB_PASSWORD}';" \
-  > /dev/null 2>&1
+# Locate the active cluster's pg_hba.conf
+PG_VERSION=$(pg_lsclusters -h | awk '{print $1}' | head -1)
+PG_CLUSTER=$(pg_lsclusters -h  | awk '{print $2}' | head -1)
+PG_HBA="/etc/postgresql/${PG_VERSION}/${PG_CLUSTER}/pg_hba.conf"
+info "Cluster: ${PG_VERSION}/${PG_CLUSTER} — pg_hba.conf: ${PG_HBA}"
 
-DB_EXISTS=$(sudo -u postgres psql -tAc \
-  "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" 2>/dev/null || echo "")
+# PostgreSQL defaults to peer auth for local socket connections, but ThingsBoard
+# connects via TCP (127.0.0.1) and needs password auth. Add the entry if absent.
+HBA_LINE="host    all             postgres        127.0.0.1/32            scram-sha-256"
+if grep -qF "127.0.0.1/32" "$PG_HBA" 2>/dev/null; then
+  info "pg_hba.conf already has a 127.0.0.1 entry — skipping"
+else
+  echo "$HBA_LINE" >> "$PG_HBA"
+  info "Added scram-sha-256 TCP entry for 127.0.0.1 to pg_hba.conf"
+fi
+
+# Reload so the pg_hba.conf change takes effect
+svc reload postgresql
+sleep 2
+
+# Set the postgres superuser password (via local socket — always succeeds)
+runuser -u postgres -- psql -c "ALTER USER postgres WITH PASSWORD '${DB_PASSWORD}';" \
+  || error "Failed to set PostgreSQL password. Is the cluster running? Run: pg_lsclusters"
+
+# Create the thingsboard database
+DB_EXISTS=$(runuser -u postgres -- psql -tAc \
+  "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}';" || echo "")
+DB_EXISTS="${DB_EXISTS//[[:space:]]/}"
 
 if [[ "$DB_EXISTS" == "1" ]]; then
   warn "Database '${DB_NAME}' already exists — skipping creation"
 else
-  sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME};" > /dev/null
+  runuser -u postgres -- psql -c "CREATE DATABASE ${DB_NAME};" \
+    || error "Failed to create database '${DB_NAME}'"
   success "Database '${DB_NAME}' created"
 fi
 
-PGPASSWORD="$DB_PASSWORD" psql -U "$DB_USER" -d "$DB_NAME" \
-  -h 127.0.0.1 -c "SELECT 1;" > /dev/null 2>&1 \
-  || error "PostgreSQL connection test failed — check pg_hba.conf allows md5/scram on 127.0.0.1"
+# Verify TCP password auth works — this is exactly how ThingsBoard connects
+PGPASSWORD="$DB_PASSWORD" psql -U "$DB_USER" -d "$DB_NAME" -h 127.0.0.1 \
+  -c "SELECT 1;" > /dev/null \
+  || error "TCP connection test failed. pg_hba.conf reload may not have applied. Try: pg_ctlcluster ${PG_VERSION} ${PG_CLUSTER} reload"
 
-success "PostgreSQL configured and connection verified"
+success "PostgreSQL configured and TCP connection verified"
 
 # ─── Download & install ThingsBoard .deb ──────────────────────────────────────
 header "Downloading ThingsBoard CE v${TB_VERSION}"
@@ -272,14 +284,11 @@ fi
 # ─── Write ThingsBoard configuration ──────────────────────────────────────────
 header "Configuring ThingsBoard"
 
-if [[ ! -f "${TB_CONF}.orig" ]]; then
-  cp "$TB_CONF" "${TB_CONF}.orig"
-fi
+[[ ! -f "${TB_CONF}.orig" ]] && cp "$TB_CONF" "${TB_CONF}.orig"
 
 MARKER_START="# >>> tb-installer-config >>>"
 MARKER_END="# <<< tb-installer-config <<<"
 
-# Idempotent — remove previous block before re-writing
 if grep -q "$MARKER_START" "$TB_CONF" 2>/dev/null; then
   sed -i "/$MARKER_START/,/$MARKER_END/d" "$TB_CONF"
 fi
@@ -304,7 +313,25 @@ success "ThingsBoard config written to $TB_CONF"
 # ─── Configure firewall ───────────────────────────────────────────────────────
 header "Configuring UFW firewall"
 
-if command -v ufw &>/dev/null; then
+# UFW requires kernel-level iptables/netfilter access.
+# Containers (LXC, OpenVZ, Docker) usually lack these capabilities.
+# Test first by probing iptables — if it fails, skip UFW and advise the user
+# to configure their cloud provider firewall instead.
+can_use_iptables() {
+  iptables -L INPUT -n > /dev/null 2>&1
+}
+
+if ! command -v ufw &>/dev/null; then
+  warn "UFW not installed — skipping firewall setup."
+  warn "Open ports ${TB_PORT}/tcp (UI), ${MQTT_PORT}/tcp (MQTT), ${COAP_PORT}/udp (CoAP) in your cloud firewall."
+elif ! can_use_iptables; then
+  warn "iptables is not accessible (container/restricted environment) — skipping UFW."
+  warn "Configure your cloud firewall (e.g. DigitalOcean Firewall) to allow:"
+  warn "  TCP ${TB_PORT}  — ThingsBoard web UI"
+  warn "  TCP ${MQTT_PORT} — MQTT"
+  warn "  UDP ${COAP_PORT} — CoAP"
+  warn "  TCP 22  — SSH (make sure this is already open!)"
+else
   ufw --force reset > /dev/null
   ufw default deny incoming  > /dev/null
   ufw default allow outgoing > /dev/null
@@ -314,8 +341,6 @@ if command -v ufw &>/dev/null; then
   ufw allow "${COAP_PORT}"/udp   comment 'CoAP'           > /dev/null
   ufw --force enable > /dev/null
   success "Firewall configured (SSH, $TB_PORT, $MQTT_PORT, $COAP_PORT)"
-else
-  warn "UFW not available — skipping. Configure your cloud firewall manually."
 fi
 
 # ─── Initialise ThingsBoard database ──────────────────────────────────────────
@@ -336,47 +361,39 @@ success "ThingsBoard service started"
 # ─── Wait for ThingsBoard to respond ─────────────────────────────────────────
 header "Waiting for ThingsBoard to become ready (up to 3 minutes)"
 
-TIMEOUT=180
-ELAPSED=0
-INTERVAL=10
+TIMEOUT=180; ELAPSED=0; INTERVAL=10
 
 while [[ "$ELAPSED" -lt "$TIMEOUT" ]]; do
   HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
     "http://localhost:${TB_PORT}/api/v1/features" 2>/dev/null || echo "000")
-
   if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "401" ]]; then
     success "ThingsBoard is up! (HTTP $HTTP_STATUS after ${ELAPSED}s)"
     break
   fi
-
   info "Still starting… (${ELAPSED}s, HTTP $HTTP_STATUS)"
   sleep "$INTERVAL"
   ELAPSED=$(( ELAPSED + INTERVAL ))
 done
 
 if [[ "$ELAPSED" -ge "$TIMEOUT" ]]; then
-  warn "No response within ${TIMEOUT}s — it may still be starting."
-  warn "Tail the log:  tail -f /var/log/thingsboard/thingsboard.log"
-  warn "Check errors:  grep ERROR /var/log/thingsboard/thingsboard.log"
+  warn "No response within ${TIMEOUT}s — may still be starting."
+  warn "Check: tail -f /var/log/thingsboard/thingsboard.log"
 fi
 
-# ─── Build service management commands for the summary ───────────────────────
+# ─── Service command strings for the summary ─────────────────────────────────
 case "$INIT_SYSTEM" in
   systemd)
     CMD_STATUS="sudo systemctl status thingsboard"
     CMD_RESTART="sudo systemctl restart thingsboard"
-    CMD_LOGS="sudo journalctl -u thingsboard -f"
-    ;;
+    CMD_LOGS="sudo journalctl -u thingsboard -f" ;;
   none)
     CMD_STATUS="sudo /usr/share/thingsboard/bin/thingsboard.sh status"
     CMD_RESTART="sudo /usr/share/thingsboard/bin/thingsboard.sh restart"
-    CMD_LOGS="tail -f /var/log/thingsboard/thingsboard.log"
-    ;;
+    CMD_LOGS="tail -f /var/log/thingsboard/thingsboard.log" ;;
   *)
     CMD_STATUS="sudo service thingsboard status"
     CMD_RESTART="sudo service thingsboard restart"
-    CMD_LOGS="tail -f /var/log/thingsboard/thingsboard.log"
-    ;;
+    CMD_LOGS="tail -f /var/log/thingsboard/thingsboard.log" ;;
 esac
 
 # ─── Save credentials ─────────────────────────────────────────────────────────
